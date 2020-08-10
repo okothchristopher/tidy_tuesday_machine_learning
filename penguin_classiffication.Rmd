@@ -1,0 +1,453 @@
+---
+title: "Classification of penguin data"
+author: "Christopher Okoth"
+date: "8/8/2020"
+output: html_document
+---
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(palmerpenguins)
+library(ggsci)
+library(broom)
+library(skimr)
+library(ranger)
+library(xgboost)
+```
+
+They are called palmer because they live in Antarctica in a place called palmer 
+
+
+```{r}
+palmerpenguins::penguins %>% view()
+```
+### Data visualization    
+```{r}
+penguins %>% count(species)
+
+
+penguins %>% count(island)
+```
+
+```{r}
+penguins %>% 
+  filter(!is.na(sex)) %>% 
+  ggplot(aes(bill_length_mm,flipper_length_mm,color=sex,size=body_mass_g))+
+  geom_point()+
+  facet_wrap(~species)+
+  ggsci::scale_color_aaas()
+```
+
+
+# controlling for difference in species can we tell the sex of the penguins 
+```{r}
+
+penguins %>% 
+  filter(!is.na(sex)) %>% 
+  select(-year,-island)->penguins_df
+```
+
+## Build a classifier to predict the sex of the penguin     
+
+```{r}
+set.seed(154)
+split_penguin <- penguins_df %>% initial_split(strata = sex)
+split_penguin
+```
+This is really a small dataset that using it for model comparison would not be appropriate but we can try that anyways
+
+nevertheless the solution to this is to create bootstrap resamples 
+
+```{r}
+penguin_train=training(split_penguin)
+penguin_test=testing(split_penguin)
+```
+
+```{r}
+penguin_boot <- bootstraps(penguin_train)
+```
+### set up a model specification 
+Regularized regression is done by setting the engine to glmnet and adding some penalty to the model 
+Or do a lasso regression by putting in a mixture 
+```{r}
+# for logistic regression
+glm_spec <- logistic_reg() %>% 
+  set_engine("glm")
+
+# for the random forest 
+rand_spec <- rand_forest() %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification")
+```
+
+
+Random forest is a tree based model and it can be able to learn the interactions while the logistic regression is straight up a linear model 
+
+```{r}
+# we use the workflow method as it is the most appropriate one 
+penguin_wf <- workflow() %>% 
+  add_formula(sex~.)
+
+
+glm_res <- penguin_wf %>% 
+  add_model(glm_spec) %>% 
+  fit_resamples(
+    resamples=penguin_boot,
+    control=control_resamples(save_pred = T)
+  )
+
+
+rand_res <- penguin_wf %>% 
+  add_model(rand_spec) %>% 
+  fit_resamples(
+    resamples=penguin_boot,
+    control=control_resamples(save_pred = T)
+  )
+```
+
+
+### Resullts of the models 
+
+```{r}
+rand_res %>% collect_metrics()
+glm_res %>% collect_metrics()
+```
+```{r}
+rand_res %>% collect_predictions() %>% 
+  conf_mat(.pred_class,sex) %>% 
+  autoplot(type='heatmap') 
+```
+
+```{r}
+# rand_res %>% 
+#   collect_predictions() %>%  group_by(id) %>% 
+#   roc_curve(sex,.pred_class) %>% 
+#   ggplot(aes(1-specificity,sensitivity,color=id))+
+#   geom_abline(lty=1,color='blue')+
+#   geom_path()
+
+rand_spec %>% fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+  conf_mat(.pred_class,sex) %>% 
+  summary()   %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))
+```
+
+
+## Now we test the model on our test data 
+```{r}
+glm_spec %>% fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+  accuracy(.pred_class,sex) 
+
+
+# or we can use the last fit option
+penguin_wf %>% 
+  add_model(glm_spec) %>% 
+  last_fit(split_penguin) %>% 
+  collect_predictions() %>% 
+  conf_mat(.pred_class,sex) %>% 
+  summary()   %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))
+```
+
+
+## odds ratio for the logistic regression 
+
+```{r}
+glm_spec %>% fit(sex~.,data=penguin_train) %>% broom::tidy(exponentiate=T) %>% 
+  arrange(desc(estimate))
+```
+
+
+## what if we do feature scaling 
+```{r}
+penguin_recipe <- recipe(sex~.,data = penguin_train) %>% 
+  step_normalize(-all_nominal()) %>% 
+  step_dummy(species,one_hot = F)
+  
+
+prepd <- penguin_recipe %>% prep(penguin_train)
+baked <-juice(prepd)
+```
+
+
+```{r}
+glm_norm <- glm(sex~.,data = baked,family = binomial)
+# glm_norm %>% 
+#   predict(baked,response='probability')
+```
+
+
+```{r}
+penguin_wf <- workflow() %>% 
+  add_formula(sex~.)
+penguin_boot_scaled <- bootstraps(baked)
+
+glm_res_scaled <- penguin_wf %>% 
+  add_model(glm_spec) %>% 
+  fit_resamples(
+    resamples=penguin_boot_scaled,
+    control=control_resamples(save_pred = T)
+  )
+
+
+rand_res_scaled <- penguin_wf %>% 
+  add_model(rand_spec) %>% 
+  fit_resamples(
+    resamples=penguin_boot_scaled,
+    control=control_resamples(save_pred = T,verbose = TRUE)
+  )
+
+rand_res_scaled%>% collect_metrics()
+```
+```{r}
+rand_res %>% collect_metrics()
+```
+
+
+There is not a difference in the results thus in this scenario feature scaling does not make any difference as anticipated 
+
+
+
+### Tuned random forest 
+### train the hyperparameters
+
+```{r}
+model_specification <- rand_forest(mtry = tune(),
+            trees = 1000,
+            min_n = tune()) %>% set_mode("classification") %>% 
+  set_engine("ranger")
+```
+
+
+```{r}
+# penguin_wf <- penguin_wf %>% add_model(model_specification)
+## tune the hyperparameters using the grid search method 
+set.seed(345)
+penguin_folds <- vfold_cv(data = penguin_train,v=5) 
+penguin_res <- tune_grid(grid=5,
+                         penguin_wf,
+                         resamples = penguin_folds,
+                         control = control_resamples(save_pred = T,verbose = F))
+penguin_res %>% collect_metrics()
+  
+```
+
+
+```{r}
+penguin_res %>% collect_metrics() %>% 
+filter(.metric=="roc_auc") %>% select(mean,min_n,mtry) %>% 
+  #the data is in a wide shape but we would like a long   
+  pivot_longer(min_n:mtry,names_to = "parameter",values_to = "value_for_auc") %>%
+  ggplot(aes(value_for_auc,mean,color=parameter))+
+  geom_line(show.legend = F,size=3)+
+  facet_wrap(~parameter,scales = "free_x")+
+  ggsci::scale_color_aaas()+
+  ggtitle('RandomForest HYPERPARAMETERS')
+
+```
+
+```{r}
+best_params <- penguin_res  %>% 
+  select_best(metric = "roc_auc")
+
+finalize_model(model_specification,best_params) %>% 
+  fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+ conf_mat(.pred_class,sex) %>% 
+  summary() %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))
+```
+
+
+
+## XG boost model 
+
+#### Extreme Gradient Boosting (XGBOOST)
+XGBoost is an ensemble learning method.Ensemble learning offers a systematic solution to combine the predictive power of multiple learners. The resultant is a single model which gives the aggregated output from several models.
+In boosting, the trees are built sequentially such that each subsequent tree aims to reduce the errors of the previous tree. Each tree "learns" from its predecessors and updates the residual errors. Hence, the tree that grows next in the sequence will learn from an updated version of the residuals.And the process proceeds iteratively .
+
+In contrast to bagging techniques like Random Forest, in which trees are grown to their maximum extent, boosting makes use of trees with fewer splits. Such small trees, which are not very deep, are highly interpretable. Parameters like the number of trees or iterations, the rate at which the gradient boosting learns, and the depth of the tree, could be optimally selected through validation techniques like k-fold cross validation. Having a large number of trees might lead to overfitting. So, it is necessary to carefully choose the stopping criteria for boosting
+
+###### The mathematical model
+
+The boosting model works in a few steps in general :
+1. Fit a model to the data say $\mathbf{f_{1}x}=\mathbf{y}$
+2. Fit a model to the residuals $\mathbf{h_{1}x}=\mathbf{y-f_{1}x}$
+3. Create a new model $\mathbf{f_2x}=\mathbf{f_1x}+\mathbf{h_1x}$[note:$\mathbf{f_2}$ is a boosted version of $\mathbf{f_1}$ ].
+The mean square error from  $\mathbf{f_{2}x}$ is lower than that of  $\mathbf{f_{1}x}$
+
+and the process goes on and on ie ...$\mathbf{f_{m}x}=\mathbf{f_{m-1}x}+\mathbf{h_{m-1}x}$
+
+*xgboost*
+
+In XGboost we fit a model on the loss generated from the previous step . Ie we modify the boosting algorithm so that it works with any differentiable loss function .
+
+
+**Advantages or unique features of the xgboost algorithm**
+
+1. *Regularisation*- XGBoost has an option to penalize complex models through both L1 and L2 regularization. Regularization helps in preventing overfitting
+
+2. *Handling sparse data*-Missing values or data processing steps like one-hot encoding make data sparse. XGBoost incorporates a sparsity-aware split finding algorithm to handle different types of sparsity patterns in the data
+
+3. *Wheighted quantile search*- Most existing tree based algorithms can find the split points when the data points are of equal weights (using quantile sketch algorithm). However, they are not equipped to handle weighted data. XGBoost has a distributed weighted quantile sketch algorithm to effectively handle weighted data
+
+
+
+```{r}
+xgb_penguin <- boost_tree(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+xgb_penguin
+```
+```{r}
+penguin_grid <- grid_latin_hypercube(
+  finalize(mtry(),penguin_train),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  sample_size=sample_prop(),
+  loss_reduction(),
+  size = 10
+  )
+
+penguin_grid %>% as_tibble()
+## these are the possible combinations of the hyperparameter values 
+#?mtry() # since it has some unknowns
+```
+
+```{r}
+set.seed(234)
+# tunegrid computes  a set of perfomance for predetermined set of tuning parameters that correspond to a model or a recipe across one or more resamples in the data 
+penguin_folds <- vfold_cv(data = penguin_train,v=5) 
+
+boost_wf <- workflow() %>% 
+  add_formula(sex~.) %>% 
+  add_model(xgb_penguin)
+
+xgb_res <- tune_grid(
+ boost_wf,
+  resamples = penguin_folds,
+  grid = penguin_grid,
+  control = control_resamples(verbose =FALSE,save_pred = T)
+)
+```
+
+
+```{r}
+xgb_res %>% show_best(metric = 'roc_auc')
+```
+
+```{r}
+xgb_res %>% 
+  collect_metrics() %>% 
+  filter(.metric=='roc_auc') %>% 
+  pivot_longer(cols = mtry:sample_size,names_to = "parameter",values_to = "value") %>% 
+  ggplot(aes(x=value,y=mean,color=parameter))+
+  geom_line(show.legend = F,size=3)+
+  facet_wrap(~parameter,scales = 'free_x')+
+  ggsci::scale_color_aaas()+
+  ggtitle('XGB-HYPEPARAMETERS')
+```
+```{r}
+best_params <- xgb_res %>% select_best(metric = 'roc_auc')
+finalize_model(xgb_penguin,best_params) %>% 
+  fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+ conf_mat(.pred_class,sex) %>% 
+  summary() %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))
+```
+
+```{r}
+predictions_glm %>%
+  conf_mat(Churn, .pred_class) %>%
+  pluck(1) %>%
+  as_tibble() %>%
+  ggplot(aes(Prediction, Truth, alpha = n)) +
+  geom_tile(show.legend = FALSE) +
+  geom_text(aes(label = n), colour = "white", alpha = 1, size = 8)
+```
+
+
+
+##### Compare how the models perfom on the test data 
+
+
+```{r}
+## untuned random forest 
+defualt_rf <- rand_spec %>% fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+  conf_mat(.pred_class,sex) %>% 
+  summary()   %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))%>% mutate(model='default_rf')
+
+## logistic regression
+logit_reg <- penguin_wf %>% 
+  add_model(glm_spec) %>% 
+  last_fit(split_penguin) %>% 
+  collect_predictions() %>% 
+  conf_mat(.pred_class,sex) %>% 
+  summary()   %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))%>% mutate(model='logistic_regressio')
+
+### tuned random forest 
+best_params <- penguin_res  %>% 
+  select_best(metric = "roc_auc")
+
+tuned_rf <- finalize_model(model_specification,best_params) %>% 
+  fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+ conf_mat(.pred_class,sex) %>% 
+  summary() %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas"))%>% mutate(model='tuned_rf')
+
+### tuned xgboost
+best_params <- xgb_res %>% select_best(metric = 'roc_auc')
+xg <- finalize_model(xgb_penguin,best_params) %>% 
+  fit(sex~.,data=penguin_train) %>% 
+  predict(penguin_test) %>% 
+  bind_cols(penguin_test) %>% 
+ conf_mat(.pred_class,sex) %>% 
+  summary() %>% 
+  select(-.estimator) %>% filter(.metric %in%
+    c("accuracy", "precision", "recall", "f_meas")) %>% mutate(model='xgboost')
+
+defualt_rf %>%
+  bind_rows(logit_reg) %>% 
+  bind_rows(tuned_rf) %>%
+  bind_rows(xg) %>% 
+  ggplot(aes(.metric,.estimate,fill=model,label=.estimate))+
+  geom_col(position = "dodge")+
+  ggsci::scale_fill_aaas()+
+  ggtitle("barplot showing perfomance of the different models")
+  
+```
+
+A tuned random forest performs better than all the other models in consideration
+
+
+
+### Acknowledgement
+This notebook  was inspired by code from 
