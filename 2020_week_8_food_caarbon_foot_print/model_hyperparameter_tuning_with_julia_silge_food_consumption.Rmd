@@ -1,0 +1,201 @@
+---
+title: "random_forest_model_hyperparameter_tuning"
+author: "christopher okoth"
+date: "4/21/2020"
+output: html_document
+---
+```{r}
+# food_consumption <- read.csv("https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-18/food_consumption.csv")
+food_consumption <- read.csv("food_consumption.csv")
+```
+
+
+```{r fig.height=6,fig.width=9}
+library(ggthemes)
+library(tidyverse)
+food_consumption %>% ggplot(aes(x=food_category,y=co2_emmission))+geom_boxplot(fill="navy")+
+  theme_economist()+theme(axis.text.x = element_text(angle = 90,hjust = 1),plot.background = element_rect("gold3"))
+```
+
+Beef has the highest $CO-2$ consumption 
+
+let us plot food consumption per capita 
+```{r}
+food_consumption %>% ggplot(aes(x=food_category,y=consumption))+geom_boxplot(fill="red")+coord_flip()+theme_economist()
+#+theme(axis.title.x = element_text()+ xlab("Food_category")+ylab("consumption"))
+```
+
+we then get the country with the highest $CO_2$ emissions 
+
+
+```{r fig.height=15}
+food_consumption %>% ggplot(aes(x=country,y=co2_emmission))+
+ geom_bar(stat = "identity",fill="navy")+coord_flip()
+
+food_consumption %>% mutate(new_country=fct_lump(country,5))%>% ggplot(aes(x=new_country,y=co2_emmission))+
+ geom_bar(stat = "identity",fill="navy")+coord_flip()
+```
+
+## Sum emmissions per country and get the top 10
+
+
+```{r}
+sum_emmissions <- food_consumption %>% group_by(country) %>% 
+  summarise(all_emmission=sum(co2_emmission))
+sum_emmissions_order <- arrange(sum_emmissions,desc(all_emmission))
+
+```
+
+```{r}
+knitr::kable(head(sum_emmissions_order,n=10))
+```
+
+
+# But all that ca be accomplished in a single line of code 
+```{r}
+food_consumption %>% count(country,wt=co2_emmission,sort = T) %>% head(10)->top10
+```
+
+
+## then we plot 
+
+
+```{r}
+selected <- food_consumption %>% 
+  filter(country%in%sum_emmissions_order$country[1:10])#getting all the information about the top10 from the parent data 
+#mtcars$cyl%in%6
+
+```
+```{r}
+# to order make factors 
+selected$country <- factor(selected$country,levels = c("Argentina",		
+"Australia",		
+"Albania	",		
+"New Zealand",	
+"Iceland",			
+"USA",			
+"Uruguay",	
+"Brazil",		
+"Luxembourg",		
+"Kazakhstan"))
+```
+
+
+```{r fig.height=6,fig.width=10}
+selected %>% ggplot(aes(x=country,y=co2_emmission))+geom_bar(stat = "identity",fill="coral1")+theme_economist()+
+  theme(axis.text.x = element_text(angle =90,hjust = 1),plot.background = element_rect("aliceblue"))+facet_wrap(.~food_category)+coord_flip()
+```
+
+
+```{r eval=FALSE, include=FALSE}
+food_consumption %>% filter(country %in% top10$country) %>% ggplot(aes(factor(country),co2_emmission,fill=country))+geom_col()+
+  facet_wrap(~food_category)+coord_flip()+ggsci::scale_fill_simpsons()
+```
+
+
+
+
+
+
+### then we can go ahead for a radnom forest model hyperparameter tuning 
+
+```{r}
+#but first we explore our data to see just how it looks like 
+library(countrycode)
+food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent"))
+
+food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent")) %>% count(continent,wt=co2_emmission,sort = T)
+```
+Europe is by far the leading continent in co2 emmissions followed by the Americas 
+
+
+```{r}
+#then we can have the data in a wider format just so we know how much pork does each country consume and so on and so fort 
+food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent")) %>% select(-co2_emmission) %>% pivot_wider(names_from = food_category,values_from = consumption) %>% 
+  janitor::clean_names()
+```
+
+### then let us  a model to predict whether a country is in Asia or not depending on its pattern of food consumption
+```{r}
+food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent")) %>% select(-co2_emmission) %>% count(continent,wt=consumption,sort = T)
+```
+
+```{r}
+#we can create a asia column 
+# food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent")) %>% select(-co2_emmission) %>% 
+#   mutate(Asia=ifelse(continent=="Asia","Asia","Other"))
+
+
+#alternatively
+food_consumption %>% mutate(continent=countrycode(sourcevar = country,origin = "country.name",destination = "continent")) %>% select(-co2_emmission) %>% pivot_wider(names_from = food_category,values_from = consumption) %>% 
+  janitor::clean_names()%>%mutate(Asia=case_when(continent=="Asia"~"Asia",T~"Other")) %>% 
+  select(-continent,-country) %>%
+  #then we change everything else that is a character to a factor
+  mutate_if(is.character,factor)->food
+```
+
+So asia is what we are going to predict 
+
+And since every column apart from asia is numeric we can do a scatter plot matrix to just have a quick glance at our data 
+
+
+```{r}
+library(GGally)
+
+ggscatmat(food,columns = 1:11,color = "Asia",alpha=0.7)
+```
+So what does it tell us for instance in the rest of the world places with more beef havve more puoltry but in Asia that is hardly the case , and in the case of rice there is a signinficant difference in that lots of people eat rice but less so in the rest of the world 
+
+So a random forest model will be very useful since there are different parameters 
+
+#then let us go ahead and tune hyperparameters 
+```{r}
+library(tidymodels)
+#then we create some bootstap samples 
+set.seed(1234)
+food_boot <- bootstraps(food,20)#this has been done with replacement and it is the same sixe as our original dataset and so there are duplicates in it   
+```
+and the assesment part of our split is that which did not make it to our bootstrap . the bootsrap are built with random samples and it has randoms sample for the different set of countries 
+
+
+#then onto random forest 
+
+```{r}
+#so since we want to classify whether or not a country is in Asia or not 
+model_specification <- rand_forest(mode="classification",mtry = tune(),min_n = tune(),trees = 1000) %>% 
+  set_engine("ranger")#the tidy models framework 
+```
+
+
+when we train models  there are parameters that we can learn from the data . but there are those which we cannot , these are the hyperparameters 
+
+in a random forest consider trees that are voting 
+
+so mtry is how many predictors will be used randomly at each split 
+min_n is the number of data points in a node that is required for that node to be split further 
+These are parametrs we have to put ahead of time 
+
+you can either used best practices or you can tune your model
+
+
+```{r}
+#now it is time to go to tuning 
+
+tune_rf <- tune_grid(
+  Asia~.,model = model_specification,resamples = food_boot
+)
+```
+
+one can use different approaches to how you are going to search for these parameters 
+
+
+This thing is training a random forest model with every combination of mtry and min_n reasonable from the data and is fittinig every combination 20 times since that is the number of bootstraps 
+
+```{r}
+tune_rf %>% collect_metrics()
+```
+```{r}
+#then we can define the best one and specify by what metric we want this done 
+tune_rf %>% show_best(metric = "roc_auc")
+```
+## just a side not one can use parallel processing to do the tuning in the tidymodels
