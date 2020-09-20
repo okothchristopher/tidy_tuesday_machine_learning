@@ -1,0 +1,217 @@
+---
+title: "trees_data_model_random_forest_hyperparameter_tuning"
+author: "christopher okoth"
+date: "4/21/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+# WE will be dealing with san_fransisco trees dataset from tidytuesday
+
+```{r}
+library(tidyverse)
+
+#sf_trees <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-01-28/sf_trees.csv')#enables us to pass the data with column specifications undefiled 
+```
+
+so we want to build a model to predict whether a tree is DPW(Department of Public works ) maintained or not 
+
+
+
+
+
+
+## EXPLORE DATA 
+For the date of planting it is an important feature in modelling but we will have to do some feature engineering on it 
+```{r}
+trees_df <- sf_trees %>% mutate(legal_status=case_when(legal_status=="DPW Maintained"~"DPW Maintained",T~"Other")) %>% #count(legal_status,sort = T)
+ #sf_trees %>% count(caretaker,legal_status,sort = T)#shows that most of dpw maintained are taken care of by private individuals 
+  select(-address) %>% na.omit() %>% #there is no imputation we want to  do , this data is so huge no need 
+mutate_if(is.character,factor)#since we are going to do some modelling 
+```
+```{r}
+skimr::skim(trees_df)
+```
+
+We can see that the DPW is much more common than the other case 
+```{r}
+
+#this is a map of San Fransisco   
+trees_df %>% ggplot(aes(longitude,latitude,color=legal_status))+geom_point(size=0.5)+labs(color=NULL)
+
+```
+
+
+We will be able to learn thresholds and interactions 
+```{r}
+# trees_df %>% count(legal_status,caretaker) %>% group_by(caretaker,legal_status) %>% summarise(caretaker_count=sum(n)) %>% ungroup()
+
+#alternative code for the above is 
+trees_df %>% count(legal_status,caretaker) %>% add_count(caretaker,wt=n,name = "caretaker_count") %>% filter(caretaker_count>50) %>% group_by(legal_status) %>% mutate(percent_legal=n/sum(n)) %>% 
+  ggplot(aes(y=percent_legal,x=caretaker,fill=legal_status))+geom_col(position = "dodge")
+```
+
+
+
+##  BUILD MODEL
+
+```{r}
+library(tidymodels)
+set.seed(1234)
+#then we split the data and do stratified splitting 
+tree_split <- initial_split(trees_df,strata = legal_status)
+
+tree_train <- training(tree_split)
+tree_test <- testing(tree_split)
+```
+
+
+```{r}
+#we use recipes for data preprocessing 
+recipe(legal_status~.,data = tree_train) %>% 
+  update_role(tree_id,new_role = "ID") %>% #so we don't use it in the model 
+#and the things which were factors of many levels will take up a humongous amount of time to train 
+step_other(species,site_info,caretaker,plot_size,threshold = 0.02) %>% step_date(date,features = c("year")) %>% step_rm(date) %>% #step_dummy(all_nominal(),~all_outcomes()) %>% 
+ #since the data is really unbalances wrt to the predictor
+  step_downsample(legal_status)-> tree_recipe
+
+#so the recipe just specifies what the variables are goiing to do 
+#one can run the tree recipe to get an idea of the steps that have been taken 
+#then we prep the recipe 
+tree_prep <- prep(tree_recipe)
+tree_juiced <- juice(tree_prep)
+tree_juiced %>% skimr::skim()
+
+tree_juiced %>% count(caretaker)
+```
+
+
+The threshhold and those others can be tuned to optimised levels 
+
+The engine ranger for random forest will not be happy with a date as a predictor _so we use step date . this is some part of feature engineering 
+*step_other creates a specification of a recipe step that will potentially pool infrequently occurring values into an "other" category.*
+
+
+####  defining what the model is going to be 
+```{r}
+rand_forest(mtry = tune(),
+            trees = 1000,
+            min_n = tune()) %>% set_mode("classification") %>% 
+  set_engine("ranger")->model_specification
+```
+
+#### then we can go ahead and set up a work flow 
+```{r}
+workflow() %>% add_recipe(tree_recipe) %>% 
+  add_model(model_specification)->tune_workflow
+```
+
+Just a way to carry things around 
+## TRAIN HYPERPARAMETERS 
+
+```{r}
+set.seed(234)
+tree_folds <- vfold_cv(tree_train)#we then do a ten fold cross validation
+```
+
+
+In the list we have the train and asses pairs 
+
+Then we set up the parallel processing engines since this is a longass process 
+
+The most important part of this code 
+
+```{r}
+# set.seed(456)
+# doParallel::registerDoParallel()
+# tune_recipe <- tune_grid(
+#   tune_workflow,
+#   resamples = tree_folds,
+#   grid = 10
+# )
+```
+
+```{r}
+tune_recipe %>% collect_metrics()%>%
+  filter(.metric=="roc_auc") %>% select(mean,min_n,mtry) %>% 
+  #the data is in a wide shape but we would like a long   
+  pivot_longer(min_n:mtry,names_to = "parameter",values_to = "value_for_auc") %>% ggplot(aes(value_for_auc,mean,color=parameter))+geom_line()+facet_wrap(~parameter,scales = "free_x")
+
+tune_recipe %>% show_best("roc_auc")
+```
+One would have to stick to low valaues of mtry and high values of min_n or rather the other way around 
+
+If anything went wrong it would be in the notes 
+
+so how does the best model look like 
+
+
+
+# this is the best 
+```{r}
+tune_recipe %>% select_best("roc_auc")->best_auc
+```
+# ```{r}
+# tune_recipe %>% collect_metrics()%>%filter(.metric=="roc_auc") %>%mutate(min_n=factor(min_n)) %>% 
+#   ggplot(aes(mtry,mean,color=min_n))+geom_line(size=2,alpha=0.05) +geom_point()
+#  ```
+#  
+ 
+ 
+ 
+## the finalised model 
+ 
+```{r}
+finalize_model(model_specification,best_auc)->final_random_forest
+```
+
+
+# then we use the vip package for variable importance
+
+```{r}
+library(vip)
+final_random_forest %>% set_engine("ranger",importance="permutation") %>% fit(legal_status~.,data=juice(tree_prep) %>% select(-tree_id)) %>% vip(geom="point")
+```
+#these are the imoortance on the classification 
+so basically take the model then reset the engine so that it has the variable importance par in it 
+
+
+
+
+# then we have got to the point where we can actually examine how our model will perfom on the test data 
+
+
+
+```{r}
+workflow() %>% 
+  add_recipe(tree_recipe) %>% 
+  add_model(final_random_forest)->final_workflow
+```
+Then we have a very convenient function
+after tuning take your last tuned model then fit it to the training set , then evaluate it on the tetsting data  
+
+
+```{r}
+final_workflow %>% last_fit(tree_split)->final_results
+```
+
+After collecting metrics we will know whether or not we did overfit or under fit 
+
+```{r}
+final_results %>% collect_metrics()
+```
+
+We have achieved an accuracy of approximately 84 percent 
+
+The roc_auc is the area under the curve we would expect if we are to fit in the future the same model to new trees 
+Which is quite impressive
+
+
+
+
+```{r}
+final_results %>% collect_predictions() %>% mutate(correct=case_when(legal_status==.pred_class~"Correct",T~"Incorrect")) %>% 
+  bind_cols(tree_test) %>% ggplot(aes(longitude,latitude,color=correct))+geom_point(size=0.5)+labs(color=NULL)+
+  scale_color_manual(values = c("navy","cyan"))
+```
+
