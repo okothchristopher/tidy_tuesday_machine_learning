@@ -1,0 +1,123 @@
+---
+title: "MODELLING GDPR VIOLATIONS WITH TIDY MODELS"
+author: "christopher okoth"
+date: "4/30/2020"
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  chunk_output_type: console
+---
+## EXPLORE THE DATA 
+```{r}
+# gdpr_violations <- readr::read_tsv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-04-21/gdpr_violations.tsv')
+gdpr_violations <-read.csv("gdpr_fines.csv")
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+# gdpr_violations %<>% rename(country=name)
+# gdpr_violations %<>% mutate(date=mdy(date))
+# gdpr_violations %<>%mutate(date=na_if(date,"1970-01-01"))#possibly will leave these ones 
+```
+
+### some notes 
+**Article 5:** principles for processing personal data (legitimate purpose )
+**Article 6:** lawful processing of personal data ie consent etc 
+**Article 13** inform subject if personal data is collected 
+**Article 15:** right of access of data by subject 
+**Article 32:** security of data processing (breach) - you have to process people's data securely 
+```{r}
+gdpr_violations %>% count(article_violated,sort = T) %>% top_n(10) %>% knitr::kable(align = "c")#the most violated articles 
+gdpr_violations %>% separate_rows(article_violated,sep = "\\|") %>% count(article_violated,sort = T)#the actual number 
+```
+
+```{r}
+gdpr_violations %>% ggplot(aes(price+1))+geom_histogram()+scale_x_log10()
+```
+
+```{r}
+gdpr_cleaned <- gdpr_violations %>% transmute(id,country,price,
+                              article_violated,
+                              articles=str_extract_all(article_violated,pattern = "Art. \\d+|Art.\\d+")) %>% # use the | to get those without the pattern 
+  mutate(total_articles =map_int(articles,length)) %>% #parse the column to map and return an integer length of that list 
+  unnest(articles) %>%add_count(articles) %>% filter(n>10) %>% 
+  select(-n)#basically just remove that new column 
+#the data is now not in one violation per row but in article per row 
+```
+
+```{r}
+library(ggbeeswarm)
+gdpr_cleaned %>% ggplot(aes(articles,price))+
+  geom_beeswarm(priority = "random")+scale_y_log10(labels=scales::dollar_format())
+
+gdpr_cleaned %>%mutate(articles=str_replace_all(articles,pattern = "Art. ","Article") ,
+                       articles=fct_reorder(articles,price)) %>% #the default function that the reoder uses is median 
+  ggplot(aes(articles,price,color=articles))+geom_boxplot(alpha=0.2)+
+  geom_quasirandom()+scale_y_log10(labels=scales::dollar_format())+ggdark::dark_theme_gray()+theme(legend.position="None")+
+  ggtitle("Article 32 seems to have the largest fines associated with it ")
+
+```
+
+```{r}
+gdpr_cleaned %>% mutate(value=1) %>% select(-article_violated) %>% 
+  pivot_wider(names_from = articles,values_from = value,values_fn = list(value = min),values_fill = list(value=0)) %>% janitor::clean_names()->gdpr_articles
+```
+
+
+### do we have evidence that violating multiple articles is associated with higher fines 
+
+## BUILD THE MODEL 
+
+```{r}
+library(tidymodels)
+gdpr_recipe <- recipe(price~.,data=gdpr_articles) %>% 
+  step_other(country) %>% 
+  update_role(id,new_role = "id") %>% 
+  step_dummy(all_nominal())
+```
+
+
+```{r}
+gdpr_prep <- prep(gdpr_recipe)
+juice(gdpr_prep)
+```
+
+```{r}
+gdpr_workflow <- workflow() %>% add_recipe(gdpr_recipe) %>% 
+  add_model(linear_reg() %>% set_engine("lm"))
+```
+
+
+## EXPLORE THE RESULTS 
+```{r}
+#then we use the fit dunction to fit the model using the wflow 
+gdpr_workflow %>% fit(data=gdpr_articles)->gdpr_fit
+#since the above is a workflow object we have to pull stuf out of it 
+gdpr_fit %>% pull_workflow_fit() %>% tidy() %>% filter(p.value<0.5)
+```
+The more articles one violates the higher the fines one pays 
+And those who violate article 15 get the highest fines 
+
+
+
+### prediction on new data 
+
+```{r}
+new_data <- crossing(country="Other",
+                     art_5=0:1,
+                     art_15=0:1,
+                     art_6=0:1,
+                     art_32=0:1,
+                     art_13=0:1) %>% mutate(total_articles=art_5+art_15+art_6+art_32+art_13,id=row_number())
+new_data
+```
+
+
+
+
+
+
+$ \alpha $
+
+
+$\left(\sum_{i=1}^{\infty})$
