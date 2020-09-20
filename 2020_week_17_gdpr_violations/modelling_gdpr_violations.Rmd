@@ -117,7 +117,3 @@ new_data
 
 
 
-$ \alpha $
-
-
-$\left(\sum_{i=1}^{\infty})$
