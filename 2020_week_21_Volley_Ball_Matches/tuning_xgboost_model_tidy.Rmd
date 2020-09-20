@@ -1,0 +1,296 @@
+---
+title: "tuning xgboost_tidy_models"
+author: "christopher okoth"
+date: "6/6/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: inline
+---
+```{r}
+library(tidyverse)
+vb_matches <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-19/vb_matches.csv', guess_max = 76000)
+
+```
+
+```{r}
+# tuesdata <- tidytuesdayR::tt_load('2020-05-19')
+# tuesdata <- tidytuesdayR::tt_load(2020, week = 21)
+# 
+# vb_matches <- tuesdata$vb_matches
+```
+
+
+
+
+
+```{r}
+object.size(vb_matches)/1000000
+```
+
+```{r}
+some_data <- vb_matches %>% slice(1:200)
+some_data %>% str()
+```
+
+
+XGBOOST MODELS ARE QUITE THE OPTION IF ONE HAS DATA IN STRUCTURED FORMAT 
+
+we have one row per match 
+## data reshaping 
+
+```{r}
+vb_matches %>% tbl_df()
+
+vb_passerd <- vb_matches %>% 
+  transmute(
+    circuit,
+    gender,
+    year,
+    w_attacks=w_p1_tot_attacks+w_p2_tot_attacks,
+    w_blocks=w_p1_tot_blocks+w_p2_tot_blocks,
+    w_kills=w_p1_tot_kills+w_p2_tot_kills,
+    w_errors=w_p1_tot_errors+w_p2_tot_errors,
+    w_aces=w_p1_tot_aces+w_p2_tot_aces,
+    w_serve_errors=w_p1_tot_serve_errors+w_p2_tot_serve_errors,
+    w_digs=w_p1_tot_digs+w_p2_tot_digs,
+  l_attacks=l_p1_tot_attacks+l_p2_tot_attacks,
+  l_blocks=l_p1_tot_blocks+l_p2_tot_blocks,
+  l_kills=l_p1_tot_kills+l_p2_tot_kills,
+  l_errors=l_p1_tot_errors+l_p2_tot_errors,
+  l_aces=l_p1_tot_aces+l_p2_tot_aces,
+  l_serve_errors=l_p1_tot_serve_errors+l_p2_tot_serve_errors,
+  l_digs=l_p1_tot_digs+l_p2_tot_digs
+  ) %>% na.omit()
+vb_passerd
+```
+
+
+
+# we want separate rows for winners and losers 
+
+
+```{r}
+vb_winners <- vb_passerd %>% 
+  select(circuit,gender,year,w_attacks:w_digs)
+# replace the w with nothing 
+names <- names(vb_winners)
+
+names %>% str_detect(pattern = "w_*")
+names_new <- names %>% str_replace(pattern = "w_",replacement = "")
+names(vb_winners) <- names_new
+library(magrittr)
+vb_winners %<>%mutate(win="win") 
+
+### in the new model world it would have gone like this '
+# vb_winners %>% 
+#   rename_with(fun=~str_remove_all(.,"w_"),w_attacks:w_diggs)
+
+# but that is in dplyr 1.0.0 
+
+
+vb_losers <- vb_passerd %>% 
+  select(circuit,gender,year,l_attacks:l_digs)
+names_l <- names(vb_losers)
+names_new_l <- names_l %>% str_replace(pattern = "l_",replacement = "")
+names(vb_losers) <- names_new_l
+vb_losers %<>%mutate(win="lose") 
+```
+
+
+## we then have our final df
+
+```{r}
+vb_df <- vb_winners %>% 
+  bind_rows(vb_losers) %>% 
+  mutate_if(is.character,factor)
+
+vb_df %>% skimr::skim()
+```
+
+
+```{r}
+# JUST SOME EXPLORATION
+vb_df %>% 
+  pivot_longer(cols = attacks:digs,names_to = "statistic",values_to = "value") %>% 
+  ggplot(aes(gender,value,fill=win))+
+  geom_boxplot()+
+  facet_wrap(~statistic,scales = "free_y",nrow = 2)+
+  ggtitle("differences in the game stats",subtitle = "attacks looks like they make no difference on whether someone is winning or losing")
+```
+
+
+# BUILD A MODEL 
+
+```{r}
+library(tidymodels)
+vb_split <- initial_split(vb_df,strata = win)
+vb_train <- training(vb_split)
+vb_test <- testing(vb_split)
+```
+
+
+## hyper parameter tuning 
+```{r}
+#?boost_tree
+boost_model <- boost_tree(
+  mtry = tune(),
+  trees = 1000,
+  min_n = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+boost_model
+
+```
+
+
+### one can do grid_regular , that is specify what are the possible combination of hyperparameters
+
+## or another alternative is grid_latin_hypercube since the aforementioned is painfully slow 
+
+
+```{r}
+model_grid <- grid_latin_hypercube(
+  finalize(mtry(),vb_train),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  sample_size=sample_prop(),
+  loss_reduction(),
+  size = 20 
+  )
+
+model_grid %>% tbl_df()
+## these are the posssible combinations of the hyperparameter values 
+#?mtry() # since it has some ukowns 
+```
+
+
+
+```{r}
+boost_wf <- workflow() %>% 
+  add_model(boost_model) %>% 
+  add_formula(win~.)
+```
+
+```{r}
+set.seed(123)
+vb_folds <- vfold_cv(vb_train,v=5,strata = win)
+vb_folds %>% tbl_df()
+```
+
+
+```{r}
+doParallel::registerDoParallel()# we set up parallel processing because this tuning could take ages 
+set.seed(234)
+# tunegrid computes  a set of perfomance for predetermined set of tuning parameters that correspond to a model or a recipe across one or more resamples in the data 
+
+#library(xgboost)
+xgb_res <- tune_grid(
+  boost_wf,
+  resamples = vb_folds,
+  grid = model_grid,
+  control = control_resamples(verbose = T,save_pred = T)
+)
+```
+
+
+so essentially we are tuning this workflow
+
+for each of these folds we are evaluating the wf and making predictions on the assesment set of the cv
+
+```{r}
+### see our tuning results 
+xgb_res %>% 
+  collect_metrics()
+```
+
+```{r}
+xgb_res %>% 
+  show_best(metric = "roc_auc") %>% view()
+```
+
+The mean value for these metrics are close for the differnt combinations of parameters typical for xgboost 
+
+
+
+```{r}
+xgb_res %>% 
+  collect_metrics() %>% 
+  filter(.metric=='roc_auc') %>% 
+  pivot_longer(cols = mtry:sample_size,names_to = "parameter",values_to = "value") %>% 
+  ggplot(aes(x=value,y=mean,color=parameter))+
+  geom_point(show.legend = F)+
+  facet_wrap(~parameter,scales = 'free_x')
+```
+
+```{r}
+xgb_res %>% 
+  select_best("roc_auc")
+```
+
+So this is the best , the one that has the best auc , does not sample many at the splits  , has high learn rate and has pretty deep trees ,
+the minimum loss reduction 
+
+
+
+```{r}
+best_parameters <- xgb_res %>% 
+  select_best("roc_auc")
+
+final_fit <- finalize_workflow(boost_wf,parameters = best_parameters)
+final_fit
+```
+### variable importance 
+
+
+```{r}
+library(vip)
+
+final_fit %>% 
+  fit(data=vb_train) %>% 
+  pull_workflow_fit() %>% 
+  vip(geom="col",aesthetics = list(fill="maroon"))+
+  ggtitle("what are the things that contribute the most to the classification\n
+          they make the biggest differnce between a win and a loss")
+```
+we want to undesrtand what is driving the prediction
+
+## last fit 
+
+so essentially this is the bit of fitting the final best model to the training set and evaluate on the testing set  
+
+```{r}
+final_result <- last_fit(final_fit,vb_split)
+
+# these are predictions on the testing data 
+final_result %>% 
+  collect_predictions() %>% 
+   conf_mat(truth=win,.pred_class) %>% 
+  autoplot(type="heatmap")+
+  ggthemes::theme_economist()+
+  theme(legend.position = "none")
+
+# one can try a mosaic plot to see the difference 
+```
+
+So we are training on the training set and evaluating on the testing set 
+
+
+```{r}
+final_result %>% 
+  collect_predictions() %>% 
+  roc_curve(win,.pred_win) %>% 
+  autoplot()+
+  ggtitle("visualization of how the model perfomed for\n the different thresholds for the\n true poisitives and false positives")
+```
+
+
+
+
+
+
+
